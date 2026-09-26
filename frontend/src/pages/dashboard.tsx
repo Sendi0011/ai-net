@@ -8,6 +8,7 @@ import { DashboardLayout } from '../components/dashboard/DashboardLayout';
 import { KpiCard } from '../components/dashboard/KpiCard';
 import { NetworkHealthBadge } from '../components/dashboard/NetworkHealthBadge';
 import { RecentTasksTable } from '../components/dashboard/RecentTasksTable';
+import { AgentWatchdogPanel } from '../components/dashboard/AgentWatchdogPanel';
 import { useToast } from '../hooks/useToast';
 import { Skeleton, SkeletonAvatar, SkeletonCard, SkeletonTable } from '../components/common/Skeleton';
 import styles from './dashboard.module.css';
@@ -19,6 +20,13 @@ const toSeries = (points: TimePoint[] | undefined): number[] => {
     return points.map((p) => p.value);
   }
   return [];
+};
+
+// Sub-cent totals need more precision than cents, or a real cost renders as $0.00.
+const formatCostUsd = (value: number): string => {
+  if (!Number.isFinite(value) || value === 0) return '$0.00';
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
 };
 
 const syntheticSeries = (value: number, length = 7): number[] => {
@@ -111,6 +119,9 @@ export const DashboardPage: React.FC = () => {
     toSeries(kpiData.tasksLast7d).length > 0
       ? toSeries(kpiData.tasksLast7d)
       : syntheticSeries(Math.round(kpiData.uptimePercent));
+  // No synthetic fallback: inventing a spend series for a metric that is
+  // actually measured would make a zero-cost platform look like it had a trend.
+  const costSeries = toSeries(kpiData.cost?.costLast7d);
 
   return (
     <DashboardLayout className="fade-in">
@@ -119,6 +130,14 @@ export const DashboardPage: React.FC = () => {
         <KpiCard title={t('page.dashboard.totalTasks')} value={kpiData.totalTasks} sparklineData={tasksSeries} loading={loading} />
         <KpiCard title={t('page.dashboard.totalXLM')} value={kpiData.totalXLMTransacted} sparklineData={xlmSeries} loading={loading} />
         <KpiCard title={t('page.dashboard.uptime')} value={`${kpiData.uptimePercent.toFixed(2)}%`} sparklineData={uptimeSeries} loading={loading} />
+        {/* Platform LLM spend (Issue #390). Renders as a string, so KpiCard shows
+            it verbatim rather than count-animating a dollar figure. */}
+        <KpiCard
+          title={t('page.dashboard.totalCost', { defaultValue: 'LLM spend' })}
+          value={formatCostUsd(kpiData.cost?.costUsd ?? 0)}
+          sparklineData={costSeries}
+          loading={loading}
+        />
       </section>
       <section className={styles.health}>
         <NetworkHealthBadge uptimePercent={kpiData.uptimePercent} />
@@ -127,6 +146,8 @@ export const DashboardPage: React.FC = () => {
         <h2 className={styles.heading}>{t('page.dashboard.recentTasks')}</h2>
         <RecentTasksTable walletAddress={address ?? ''} loading={loading} />
       </section>
+      {/* Agent heartbeat health (Issue #379) */}
+      <AgentWatchdogPanel />
     </DashboardLayout>
   );
 };

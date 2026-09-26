@@ -40,25 +40,19 @@ import { agentsRouter } from "./routes/agents";
 import { healthRouter } from "./routes/health";
 import { metricsRouter } from "./routes/metrics";
 import { createStatsRouter } from "./routes/stats";
+import { createCostRouter } from "./routes/costs";
 import { createReconciliationRouter, type ReconciliationRouterOptions } from "./routes/reconciliation";
 import { rateLimitMiddleware, registerRateLimitMiddleware, publicLimiter, authedLimiter, adminLimiter } from "./middleware/rateLimit";
 import { authMiddleware } from "./middleware/auth";
 import { createCorsMiddleware } from "./middleware/cors";
 import { compressionMiddleware } from "./middleware/compression";
-import { createCorsMiddleware } from "./middleware/cors";
 import { errorHandler } from "./middleware/errorHandler";
 import { readOnlyMiddleware } from "./middleware/readOnly";
-import { registerRateLimitMiddleware } from "./middleware/rateLimit";
 import { requestId } from "./middleware/requestId";
 import { requestLogger } from "./middleware/requestLogger";
 import { versioningMiddleware } from "./middleware/versioning";
 import { getOpenapiJson, getOpenapiYaml, openapiSpec, swaggerUiOptions } from "./docs";
-import { agentsRouter } from "./routes/agents";
 import { createAdminRouter } from "./routes/admin";
-import { healthRouter } from "./routes/health";
-import { createReconciliationRouter, type ReconciliationRouterOptions } from "./routes/reconciliation";
-import { createStatsRouter } from "./routes/stats";
-import { attachTaskStream, getStreamConnectionCount, type TaskStreamOptions } from "./routes/stream";
 import { createV1TasksRouter } from "./routes/v1/tasks";
 import { createV2TasksRouter } from "./routes/v2/tasks";
 import { createAuthRouter } from "./routes/auth";
@@ -69,18 +63,16 @@ import { ValidationError, UnauthorizedError, NotFoundError, AppError } from "../
 import { createHeartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat";
 import { createTaskJobHandler } from "../coordinator/coordinator";
 import {
-  openapiSpec,
-  swaggerUiOptions,
-  getOpenapiJson,
-  getOpenapiYaml,
-} from "./docs";
-import {
   getGlobalJobQueue,
   JobWorker,
   type JobQueue,
 } from "../queue";
 import { createAdminQueueRouter } from "./routes/admin";
-import { metricsService, metricsMiddleware } from "../services/metrics";
+import { createFlagsRouter } from "./routes/flags";
+import { createVersionsRouter } from "./routes/versions";
+import { createAgentWatchdogRouter } from "./routes/agentWatchdog";
+import { createAgentWatchdog } from "../services/agentWatchdog";
+import { flushActiveCosts, setPricingOverrides } from "../services/budget";
 
 export interface AppOptions {
   dispatch?: DispatchFn;
@@ -113,6 +105,31 @@ function tryLoadStellarRelease(): StellarReleasePaymentFn | undefined {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     return require("../../../smart-contracts/src/payment/payment")
       .releasePayment as StellarReleasePaymentFn;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reconcile a watchdog eviction against the agent registry (Issue #379).
+ *
+ * Read-only on purpose. `deregister_agent` is a `require_auth`'d on-chain
+ * mutation, and silently issuing it from a heartbeat timer would both bypass the
+ * contract's authorization model and remove a registration without an operator
+ * having chosen to. So this only *detects* divergence — an agent the watchdog
+ * just dropped locally that is still present in the registry — and reports it
+ * through the eviction alert as `deregisterRequired`, leaving the actual
+ * deregistration to an authorized operator or job.
+ */
+function tryLoadRegistryLookup():
+  | { getAgent: (id: string) => unknown }
+  | undefined {
+  if (!getConfig().REGISTRY_CONTRACT_ID) return undefined;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require("../../../smart-contracts/src/registry/registry") as {
+      getAgent: (id: string) => unknown;
+    };
   } catch {
     return undefined;
   }
@@ -166,12 +183,64 @@ export function createApp(opts: AppOptions = {}): {
     jobWorker.start();
   }
 
-  const heartbeatService = createHeartbeatService(opts.heartbeatOptions);
+  // The watchdog owns liveness detection from here on, so the heartbeat
+  // service's own stale→offline sweep is disabled: it would flip an agent
+  // offline on a shorter timer, without a grace clock or an alert, leaving the
+  // agent invisible to the watchdog and unalerted until the 24h delete.
+  const heartbeatService = createHeartbeatService({
+    ...opts.heartbeatOptions,
+    enableMarkStale: false,
+  });
   if (
     opts.enableHeartbeatCleanup ||
     (opts.enableHeartbeatCleanup !== false && config.NODE_ENV !== "test")
   ) {
     heartbeatService.start();
+  }
+
+  // ── Token budget + cost accounting (Issue #390) ───────────────────────────
+  // Install env pricing overrides once, so every ledger and every reprice uses
+  // the same rates.
+  setPricingOverrides(config.VENICE_PRICING);
+
+  // Flush in-flight costs on a timer. Without this, a crash mid-task loses the
+  // spend for every task that never reached a terminal state — which are
+  // exactly the runs an operator wants to see.
+  const costFlushMs = config.COST_FLUSH_INTERVAL_MS;
+  const costFlushTimer =
+    config.NODE_ENV === "test"
+      ? null
+      : setInterval(() => {
+          try {
+            flushActiveCosts();
+          } catch (err) {
+            logger.error({ err }, "cost flush failed");
+          }
+        }, costFlushMs);
+  // Do not hold the event loop open on this timer alone.
+  costFlushTimer?.unref?.();
+
+  // ── Agent heartbeat watchdog (Issue #379) ─────────────────────────────────
+  const registryLookup = tryLoadRegistryLookup();
+  const watchdog = createAgentWatchdog({
+    intervalMs: config.AGENT_WATCHDOG_INTERVAL_MS,
+    gracePeriodMinutes: config.AGENT_WATCHDOG_GRACE_MINUTES,
+    onEvict: registryLookup
+      ? async (agent) => {
+          const stillRegistered = registryLookup.getAgent(agent.id) !== undefined;
+          logger.warn(
+            {
+              agentId: agent.id,
+              stillRegistered,
+              deregisterRequired: stillRegistered,
+            },
+            "agent evicted locally but still present in the registry; authorized deregistration required",
+          );
+        }
+      : undefined,
+  });
+  if (config.NODE_ENV !== "test") {
+    watchdog.start();
   }
 
   // ── Health routes ───────────────────────────────────────────────────────────
@@ -184,6 +253,13 @@ export function createApp(opts: AppOptions = {}): {
   // ── Stats routes ───────────────────────────────────────────────────────────
   app.use("/api/stats", publicLimiter.middleware, createStatsRouter(getTaskDb()));
 
+  // Cost routes (Issue #390): /api/costs (operator rollup) and
+  // /api/tasks/:id/cost (wallet-scoped, ownership-checked in the handler).
+  // Mounted before the task router so the cost path is matched first; the two
+  // do not actually collide, because the task router's `/:id` matches a single
+  // path segment and `/:id/cost` is two.
+  app.use("/api", publicLimiter.middleware, createCostRouter());
+
   // ── Auth routes ────────────────────────────────────────────────────────────
   app.use("/api/auth", createAuthRouter(opts.authService));
 
@@ -193,6 +269,13 @@ export function createApp(opts: AppOptions = {}): {
   app.use("/api/agents", publicLimiter.middleware);
   app.post("/api/agents/register", registerRateLimitMiddleware);
   app.use("/api/agents", agentsRouter);
+
+  // ── Agent watchdog alerts (Issue #379) ─────────────────────────────────────
+  app.use(
+    "/api/agent-watchdog",
+    publicLimiter.middleware,
+    createAgentWatchdogRouter({ tick: () => watchdog.tick() }),
+  );
 
   app.get("/openapi.json", (_req: Request, res: Response) => {
     res.json(openapiSpec);
@@ -210,11 +293,7 @@ export function createApp(opts: AppOptions = {}): {
     } else {
       return v2TasksRouter(req, res, next);
     }
-    return v2TasksRouter(req, res, next);
   });
-
-  // ── Prometheus metrics endpoint ──────────────────────────────────────
-  app.use("/metrics", metricsRouter);
 
   // ── Admin Queue routes ─────────────────────────────────────────────────────
   app.use("/api/admin/queue", adminLimiter.middleware, createAdminQueueRouter(jobQueue));
@@ -275,6 +354,8 @@ export function createApp(opts: AppOptions = {}): {
     // JobWorker.start() via recoverIncompleteJobs().
     jobWorker.stop(opts.jobWorkerStopTimeoutMs ?? 10_000).finally(() => {
       heartbeatService.stop();
+      watchdog.stop();
+      if (costFlushTimer) clearInterval(costFlushTimer);
       metricsService.setWebSocketProbe(null);
       detachStream();
       if (httpServer.listening) {
