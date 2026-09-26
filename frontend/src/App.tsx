@@ -12,7 +12,21 @@ import ErrorBoundary from './components/common/ErrorBoundary'
 import { ProtectedRoute } from './components/auth/ProtectedRoute'
 import { CommandPalette } from './components/common/CommandPalette'
 import { useCommandPalette } from './hooks/useCommandPalette'
+import RouteLoader from './components/common/RouteLoader'
 import './components/common/Toast.css'
+
+// Code-split every authenticated route: the dashboard pulls in the task graph
+// and charts, and AgentsPage pulls in the renderer demo, so eagerly importing
+// them all would put the whole app in the landing-page bundle.
+const DashboardPage = lazy(() => import('./pages/dashboard'))
+const WalletPage = lazy(() => import('./pages/WalletPage'))
+const AgentsPage = lazy(() => import('./pages/AgentsPage'))
+const NewTaskPage = lazy(() => import('./pages/tasks/NewTaskPage'))
+const TaskHistoryPage = lazy(() => import('./pages/tasks/TaskHistoryPage'))
+const TaskDetailPage = lazy(() => import('./pages/TaskDetailPage'))
+const RendererDemoPage = lazy(() => import('./pages/RendererDemoPage'))
+
+const RouteLoadingFallback: React.FC = () => <RouteLoader />
 
 // Lives INSIDE <Router> and the theme/wallet providers: useCommandPalette()
 // calls useNavigate(), useTheme() and useWallet(), which all require their

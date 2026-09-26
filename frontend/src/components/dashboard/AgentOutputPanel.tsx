@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronUp, Terminal, Copy, Check } from 'lucide-react';
+import { ChevronDown, ChevronUp, Terminal } from 'lucide-react';
+import { AgentOutputViewer } from '../agents/AgentOutputViewer';
 
 interface AgentOutputPanelProps {
   outputs: Record<string, string>;
@@ -17,8 +18,6 @@ export const AgentOutputPanel: React.FC<AgentOutputPanelProps> = ({
 }) => {
   const { t } = useTranslation();
   const [isOpen, setIsOpen] = useState(true);
-  const [copied, setCopied] = useState(false);
-  const outputContainerRef = useRef<HTMLDivElement>(null);
 
   // Default to first active or completed node if none selected
   useEffect(() => {
@@ -28,30 +27,19 @@ export const AgentOutputPanel: React.FC<AgentOutputPanelProps> = ({
     }
   }, [nodes, selectedNodeId, onSelectNode]);
 
-  // Scroll to bottom when output updates
   const activeOutput = selectedNodeId ? outputs[selectedNodeId] || '' : '';
-  
-  useEffect(() => {
-    if (outputContainerRef.current) {
-      outputContainerRef.current.scrollTop = outputContainerRef.current.scrollHeight;
-    }
-  }, [activeOutput, isOpen]);
 
-  const handleCopy = async () => {
-    if (!activeOutput) return;
-    try {
-      await navigator.clipboard.writeText(activeOutput);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy text', err);
-    }
-  };
+  const selectedNode = selectedNodeId ? nodes.find(n => n.nodeId === selectedNodeId) : undefined;
+  // The filename stem carries the node id and capability so two agents' exports
+  // in the same download folder never collide.
+  const filenameBase = selectedNode
+    ? `agent-output-${selectedNode.nodeId}-${selectedNode.agentType}`
+    : 'agent-output';
 
   return (
     <div className="glass-panel mt-6 overflow-hidden flex flex-col transition-all duration-300" style={{ minHeight: isOpen ? '380px' : '64px', height: isOpen ? '420px' : '64px' }}>
       {/* Header */}
-      <div 
+      <div
         className="flex justify-between items-center pb-3 border-b border-[var(--panel-border)] cursor-pointer select-none"
         onClick={() => setIsOpen(!isOpen)}
         style={{ height: '40px' }}
@@ -61,19 +49,6 @@ export const AgentOutputPanel: React.FC<AgentOutputPanelProps> = ({
           <h3 className="text-md font-semibold text-[var(--text-primary)]">{t('task.output.title')}</h3>
         </div>
         <div className="flex items-center gap-4">
-          {isOpen && activeOutput && (
-            <button 
-              onClick={(e) => {
-                e.stopPropagation();
-                handleCopy();
-              }}
-              className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 transition"
-              title={t('a11y.copyOutput')}
-            >
-              {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} className="text-slate-400" />}
-              <span>{copied ? t('task.output.copied') : t('task.output.copy')}</span>
-            </button>
-          )}
           {isOpen ? <ChevronUp size={20} className="text-slate-400" /> : <ChevronDown size={20} className="text-slate-400" />}
         </div>
       </div>
@@ -91,8 +66,8 @@ export const AgentOutputPanel: React.FC<AgentOutputPanelProps> = ({
                   key={node.nodeId}
                   onClick={() => onSelectNode(node.nodeId)}
                   className={`w-full text-left px-3 py-2 rounded-lg text-xs font-medium transition flex flex-col gap-0.5 ${
-                    isActive 
-                      ? 'bg-indigo-600/30 text-indigo-200 border border-indigo-500/50' 
+                    isActive
+                      ? 'bg-indigo-600/30 text-indigo-200 border border-indigo-500/50'
                       : 'hover:bg-slate-800/50 text-[var(--text-secondary)] border border-transparent'
                   } ${hasOutput ? 'text-slate-100' : ''}`}
                 >
@@ -114,30 +89,22 @@ export const AgentOutputPanel: React.FC<AgentOutputPanelProps> = ({
             })}
           </div>
 
-          {/* Terminal Console Output */}
-          <div className="flex-1 pl-4 flex flex-col bg-slate-950/80 rounded-lg border border-slate-900 overflow-hidden relative">
-            <div 
-              ref={outputContainerRef}
-              className="flex-1 overflow-y-auto p-4 font-mono text-xs leading-relaxed text-slate-300"
-              style={{ contentVisibility: 'auto' }}
-            >
-              {activeOutput ? (
-                <pre className="whitespace-pre-wrap break-words">{activeOutput}</pre>
-              ) : (
-                <div className="flex flex-col items-center justify-center h-full text-slate-500">
-                  <Terminal size={32} className="opacity-20 mb-2" />
-                  <div>
-                    {selectedNodeId ? (
-                      nodes.find(n => n.nodeId === selectedNodeId)?.status === 'pending'
-                        ? t('task.output.waitingForNode')
-                        : t('task.output.executing')
-                    ) : (
-                      t('task.output.selectNode')
-                    )}
-                  </div>
+          {/* Highlighted, exportable output */}
+          <div className="flex-1 pl-4 min-w-0">
+            {activeOutput ? (
+              <AgentOutputViewer output={activeOutput} filenameBase={filenameBase} />
+            ) : (
+              <div className="flex flex-col items-center justify-center h-full bg-slate-950/80 rounded-lg border border-slate-900 text-slate-500">
+                <Terminal size={32} className="opacity-20 mb-2" />
+                <div>
+                  {selectedNodeId
+                    ? selectedNode?.status === 'pending'
+                      ? t('task.output.waitingForNode')
+                      : t('task.output.executing')
+                    : t('task.output.selectNode')}
                 </div>
-              )}
-            </div>
+              </div>
+            )}
           </div>
         </div>
       )}
